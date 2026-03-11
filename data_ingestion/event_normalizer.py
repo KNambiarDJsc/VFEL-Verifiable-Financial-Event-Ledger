@@ -1,161 +1,239 @@
 """
-data_ingestion/jsonl_loader.py
+data_ingestion/event_normalizer.py
 
-Streaming JSONL loader for VFEL — Verifiable Financial Event Ledger.
+Event Normalizer for VFEL — Verifiable Financial Event Ledger.
 
-Design principles:
-- Generator-based: never loads full file into memory (critical for million-event datasets)
-- Fault-tolerant: malformed lines are captured, logged, and skipped — not fatal
-- Stateful: tracks line number, byte offset, and parse errors for observability
-- Interface: yields raw dicts with source metadata attached (origin file, line, offset)
+Responsibilities:
+- Convert VCPEvent (VCP-schema) → LedgerEvent (VFEL internal schema)
+- Resolve timestamps to a canonical nanosecond epoch int
+- Assign a stable ledger_event_id (deterministic, content-addressed)
+- Classify event types into VFEL's internal EventClass taxonomy
+- Strip VCP-specific fields not needed in the ledger
 
-This is the entry point for all historical JSONL replay and live file tailing.
+This is the schema boundary. Everything above is "VCP world", everything
+below is "VFEL world". Keeping this clean = easy to swap in other event
+sources later (FIX, websocket feeds, Kafka topics, etc.)
 """
 
+from __future__ import annotations
+
+import hashlib
 import json
-import os
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Generator, Optional
 import logging
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Optional
+
+from data_ingestion.event_parser import VCPEvent
 
 logger = logging.getLogger(__name__)
 
 
+# ──────────────────────────────────────────────
+# VFEL Internal Event Schema
+# ──────────────────────────────────────────────
+
+class EventClass(str, Enum):
+    """
+    VFEL's internal event taxonomy.
+    VCP event_type strings are mapped to these at normalization time.
+    """
+    TRADE = "TRADE"
+    QUOTE = "QUOTE"
+    ORDER = "ORDER"
+    CANCEL = "CANCEL"
+    STATUS = "STATUS"
+    ANCHOR = "ANCHOR"       # Cryptographic anchor events
+    UNKNOWN = "UNKNOWN"     # Fallthrough — still ingested, just unclassified
+
+
+# Maps VCP event_type strings (lowercased) → EventClass
+_VCP_TYPE_MAP: dict[str, EventClass] = {
+    "trade": EventClass.TRADE,
+    "execution": EventClass.TRADE,
+    "fill": EventClass.TRADE,
+    "quote": EventClass.QUOTE,
+    "bid": EventClass.QUOTE,
+    "ask": EventClass.QUOTE,
+    "order": EventClass.ORDER,
+    "new_order": EventClass.ORDER,
+    "order_new": EventClass.ORDER,
+    "cancel": EventClass.CANCEL,
+    "order_cancel": EventClass.CANCEL,
+    "cancelled": EventClass.CANCEL,
+    "status": EventClass.STATUS,
+    "heartbeat": EventClass.STATUS,
+    "anchor": EventClass.ANCHOR,
+}
+
+
 @dataclass
-class RawEvent:
+class LedgerEvent:
     """
-    A raw parsed JSON line from the JSONL stream.
-    Carries source provenance — essential for debugging replays and audit trails.
+    VFEL's canonical internal event representation.
+
+    This is what flows through every layer of the system post-ingestion:
+    Merkle trees, DAG blocks, proof generation, API responses.
+
+    Immutable by convention — never mutate after creation.
     """
-    data: dict
+
+    # ── Identity ──────────────────────────────
+    ledger_event_id: str        # Deterministic content-addressed ID (SHA256)
+    shard_key: str              # Shard assignment (symbol or hash prefix)
+    event_class: EventClass     # Normalized event type
+
+    # ── Timing ────────────────────────────────
+    timestamp_ns: int           # Canonical nanosecond epoch timestamp
+    ingested_at_ns: int         # Wall clock at normalization (for latency tracking)
+
+    # ── Source provenance ─────────────────────
     source_file: str
-    line_number: int
-    byte_offset: int
+    source_line: int
+    source_byte_offset: int
+
+    # ── Crypto fields from VCP ─────────────────
+    original_event_hash: Optional[str]   # Hash as declared in VCP event
+    original_prev_hash: Optional[str]    # Chain linkage from VCP
+    original_signature: Optional[str]    # Signature from VCP
+    content_hash: str                    # VFEL's own hash of raw_payload
+
+    # ── Raw payload (normalized copy) ─────────
+    payload: dict[str, Any]
+
+    # ── Derived fields ────────────────────────
+    symbol: Optional[str] = None
+    sequence: Optional[int] = None
+
+    def to_dict(self) -> dict:
+        """Serialize for storage / wire. Used by ledger_core event store."""
+        return {
+            "ledger_event_id": self.ledger_event_id,
+            "shard_key": self.shard_key,
+            "event_class": self.event_class.value,
+            "timestamp_ns": self.timestamp_ns,
+            "ingested_at_ns": self.ingested_at_ns,
+            "source_file": self.source_file,
+            "source_line": self.source_line,
+            "original_event_hash": self.original_event_hash,
+            "original_prev_hash": self.original_prev_hash,
+            "content_hash": self.content_hash,
+            "symbol": self.symbol,
+            "sequence": self.sequence,
+            "payload": self.payload,
+        }
 
 
-@dataclass
-class LoaderStats:
+# ──────────────────────────────────────────────
+# Normalizer
+# ──────────────────────────────────────────────
+
+class EventNormalizer:
     """
-    Tracks ingestion health metrics during a streaming session.
-    Exposed for observability — feed into Prometheus/Datadog in prod.
-    """
-    total_lines: int = 0
-    parsed_ok: int = 0
-    parse_errors: int = 0
-    empty_lines: int = 0
-    error_samples: list = field(default_factory=list)  # Keep first N errors for debugging
+    Converts VCPEvents into LedgerEvents.
 
-    MAX_ERROR_SAMPLES = 10
+    Stateless — safe to call concurrently from multiple threads/processes.
+    All decisions are deterministic: same input → same LedgerEvent every time.
 
-    def record_error(self, line_no: int, raw: str, exc: Exception):
-        self.parse_errors += 1
-        if len(self.error_samples) < self.MAX_ERROR_SAMPLES:
-            self.error_samples.append({
-                "line": line_no,
-                "raw_snippet": raw[:120],  # Truncate — don't bloat memory
-                "error": str(exc),
-            })
-
-
-class JSONLLoader:
-    """
-    Streaming JSONL reader. Generator-based, O(1) memory per line.
-
-    Usage:
-        loader = JSONLLoader("vcp_rta_events.jsonl")
-        for raw_event in loader.stream():
-            process(raw_event)
-
-    Can stream multiple files sequentially via stream_files([...]).
+    normalize_stream() is the hot path for pipeline use.
     """
 
-    def __init__(self, file_path: str | Path, encoding: str = "utf-8"):
-        self.file_path = Path(file_path)
-        self.encoding = encoding
-        self.stats = LoaderStats()
+    def normalize(self, vcp_event: VCPEvent) -> LedgerEvent:
+        """Convert a single VCPEvent to LedgerEvent."""
+        meta = vcp_event.meta
+        crypto = vcp_event.crypto
 
-        if not self.file_path.exists():
-            raise FileNotFoundError(f"JSONL file not found: {self.file_path}")
+        # Resolve canonical timestamp
+        timestamp_ns = _resolve_timestamp_ns(meta.timestamp_ns, meta.timestamp_ms)
 
-    def stream(self) -> Generator[RawEvent, None, None]:
-        """
-        Stream events one line at a time.
-        Yields RawEvent for each valid JSON line.
-        Skips and logs malformed lines — never raises mid-stream.
-        """
-        byte_offset = 0
-        self.stats = LoaderStats()  # Reset stats on each stream call
+        # Classify event type
+        event_class = _classify_event_type(meta.event_type)
 
-        with open(self.file_path, "r", encoding=self.encoding) as fh:
-            for line_number, raw_line in enumerate(fh, start=1):
-                self.stats.total_lines += 1
-                line_bytes = len(raw_line.encode(self.encoding))
+        # Determine shard key (symbol preferred; fall back to hash prefix)
+        shard_key = _resolve_shard_key(meta.symbol, vcp_event.content_hash)
 
-                stripped = raw_line.strip()
-
-                if not stripped:
-                    self.stats.empty_lines += 1
-                    byte_offset += line_bytes
-                    continue
-
-                try:
-                    data = json.loads(stripped)
-
-                    if not isinstance(data, dict):
-                        # Reject non-object JSON — VFEL only handles event objects
-                        raise ValueError(f"Expected JSON object, got {type(data).__name__}")
-
-                    self.stats.parsed_ok += 1
-                    yield RawEvent(
-                        data=data,
-                        source_file=str(self.file_path),
-                        line_number=line_number,
-                        byte_offset=byte_offset,
-                    )
-
-                except (json.JSONDecodeError, ValueError) as exc:
-                    self.stats.record_error(line_number, raw_line, exc)
-                    logger.warning(
-                        "Skipping malformed line %d in %s: %s",
-                        line_number, self.file_path.name, exc
-                    )
-
-                finally:
-                    byte_offset += line_bytes
-
-        logger.info(
-            "Stream complete: %s — %d ok / %d errors / %d total",
-            self.file_path.name,
-            self.stats.parsed_ok,
-            self.stats.parse_errors,
-            self.stats.total_lines,
+        # Compute deterministic ledger event ID
+        # ID = SHA256(source_file + line_number + content_hash)
+        # This ensures uniqueness across multi-file replays
+        ledger_event_id = _compute_ledger_id(
+            source_file=vcp_event.source_file,
+            line_number=vcp_event.line_number,
+            content_hash=vcp_event.content_hash,
         )
 
-    def get_stats(self) -> LoaderStats:
-        return self.stats
+        return LedgerEvent(
+            ledger_event_id=ledger_event_id,
+            shard_key=shard_key,
+            event_class=event_class,
+            timestamp_ns=timestamp_ns,
+            ingested_at_ns=time.time_ns(),
+            source_file=vcp_event.source_file,
+            source_line=vcp_event.line_number,
+            source_byte_offset=vcp_event.byte_offset,
+            original_event_hash=crypto.event_hash,
+            original_prev_hash=crypto.prev_hash,
+            original_signature=crypto.signature,
+            content_hash=vcp_event.content_hash,
+            payload=dict(vcp_event.raw_payload),  # Shallow copy — payload is treated as immutable
+            symbol=meta.symbol,
+            sequence=meta.sequence,
+        )
+
+    def normalize_stream(self, vcp_events):
+        """Generator: normalize a stream of VCPEvents into LedgerEvents."""
+        for vcp_event in vcp_events:
+            try:
+                yield self.normalize(vcp_event)
+            except Exception as exc:
+                logger.error(
+                    "Normalization failed for line %d: %s",
+                    vcp_event.line_number, exc
+                )
+                # Don't propagate — keep the pipeline moving
 
 
-class MultiFileLoader:
+# ──────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────
+
+def _resolve_timestamp_ns(ts_ns: Optional[int], ts_ms: Optional[int]) -> int:
     """
-    Sequences multiple JSONL files into a single event stream.
-    Useful for replaying sharded historical data dumps or multi-day datasets.
+    Return canonical nanosecond timestamp.
+    Priority: explicit ns > ms converted to ns > wall clock (fallback for test data).
     """
+    if ts_ns is not None:
+        return ts_ns
+    if ts_ms is not None:
+        return ts_ms * 1_000_000  # ms → ns
+    # Fallback: use ingestion time. Events without timestamps are ordered by arrival.
+    logger.debug("No timestamp on event — using ingestion wall clock")
+    return time.time_ns()
 
-    def __init__(self, file_paths: list[str | Path], encoding: str = "utf-8"):
-        self.loaders = [JSONLLoader(p, encoding) for p in file_paths]
 
-    def stream(self) -> Generator[RawEvent, None, None]:
-        """Yields events from all files in order."""
-        for loader in self.loaders:
-            yield from loader.stream()
+def _classify_event_type(event_type: Optional[str]) -> EventClass:
+    """Map raw VCP event_type string to VFEL EventClass."""
+    if not event_type:
+        return EventClass.UNKNOWN
+    return _VCP_TYPE_MAP.get(event_type.lower().strip(), EventClass.UNKNOWN)
 
-    def aggregate_stats(self) -> dict:
-        return {
-            str(loader.file_path): {
-                "total": loader.stats.total_lines,
-                "ok": loader.stats.parsed_ok,
-                "errors": loader.stats.parse_errors,
-            }
-            for loader in self.loaders
-        }
+
+def _resolve_shard_key(symbol: Optional[str], content_hash: str) -> str:
+    """
+    Determine shard key.
+    Symbol-based sharding keeps all events for an instrument on one shard,
+    which is essential for per-symbol sequence integrity.
+    Falls back to first 8 chars of content hash for events without symbols.
+    """
+    if symbol:
+        return symbol.upper().strip()
+    return f"HASH_{content_hash[:8].upper()}"
+
+
+def _compute_ledger_id(source_file: str, line_number: int, content_hash: str) -> str:
+    """
+    Deterministic ledger event ID.
+    Stable across replays — same event always gets the same ID.
+    """
+    id_input = f"{source_file}:{line_number}:{content_hash}"
+    return hashlib.sha256(id_input.encode("utf-8")).hexdigest()
