@@ -1,0 +1,43 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# UV virtual environment
+.venv/
+
+# Python environment files
+.python-version
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Large datasets
+data/
+datasets/
+evidence/
+
+# Generated proofs / anchors
+proofs/
+anchors/
+
+# Temporary files
+*.tmp
+*.cache
