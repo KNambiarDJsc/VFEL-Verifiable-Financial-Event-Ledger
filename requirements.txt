@@ -1,0 +1,21 @@
+# VFEL – Verifiable Financial Event Ledger
+# Core dependencies
+# ─────────────────────────────────────────
+# The core library has NO third-party runtime dependencies.
+# It relies entirely on the Python standard library (Python ≥ 3.10).
+
+# ─────────────────────────────────────────
+# Optional: Development & Testing
+# ─────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=5.0.0
+pytest-timeout>=2.3.0
+
+# ─────────────────────────────────────────
+# Optional: Blockchain anchoring extras
+# (install only if using anchoring modules)
+# ─────────────────────────────────────────
+# web3>=6.0.0          # Ethereum anchoring (anchoring/ethereum_anchor.py)
+# bitcoin-utils>=0.6.0 # Bitcoin anchoring  (anchoring/bitcoin_anchor.py)
+# opentimestamps>=0.4.0 # OpenTimestamps    (anchoring/timestamp_anchor.py)
