@@ -121,66 +121,61 @@ def is_left_child(index: int) -> bool:
 # Full Tree Computation
 # ──────────────────────────────────────────────
 
+def _largest_power_of_two_below(n: int) -> int:
+    """Largest power of two strictly less than n (n >= 2). RFC 6962 split point k."""
+    return 1 << ((n - 1).bit_length() - 1)
+
+
 def compute_root(leaves: list[str]) -> str:
     """
-    Compute Merkle root from a list of leaf hashes.
-    Pads to next power of two using empty_hash().
+    Compute the RFC 6962 Merkle Tree Hash (MTH) over a list of leaf hashes.
 
-    Returns the root hash as a hex string.
-    O(n) time, O(n) space — not used on the hot path.
-    Use IncrementalMerkleTree for streaming append.
+    MTH({})      = empty_hash()
+    MTH({d0})    = d0
+    MTH(D[n])    = hash_node(MTH(D[0:k]), MTH(D[k:n])),  k = largest 2^i < n
+
+    This is an UNBALANCED, left-perfect tree — NOT a power-of-two-padded tree.
+    Using this definition makes compute_root() bit-identical to the incremental
+    frontier root() for every leaf count, which is required for proof soundness:
+    an inclusion proof must verify against the same root that gets sealed and
+    anchored. (Previously this padded to next_power_of_two with empty_hash(),
+    which diverged from root() at every non-power-of-two count.)
+
+    O(n) time — not the hot path. Use IncrementalMerkleTree for streaming append.
     """
-    if not leaves:
+    n = len(leaves)
+    if n == 0:
         return empty_hash()
-
-    if len(leaves) == 1:
+    if n == 1:
         return leaves[0]
-
-    # Pad to next power of two
-    size = next_power_of_two(len(leaves))
-    level = list(leaves) + [empty_hash()] * (size - len(leaves))
-
-    # Build tree bottom-up
-    while len(level) > 1:
-        next_level = []
-        for i in range(0, len(level), 2):
-            next_level.append(hash_node(level[i], level[i + 1]))
-        level = next_level
-
-    return level[0]
+    k = _largest_power_of_two_below(n)
+    return hash_node(compute_root(leaves[:k]), compute_root(leaves[k:]))
 
 
 def compute_proof_path(leaves: list[str], leaf_index: int) -> list[tuple[str, str]]:
     """
-    Compute the Merkle proof path for a leaf at leaf_index.
+    RFC 6962 Merkle audit path for the leaf at leaf_index.
 
-    Returns a list of (direction, sibling_hash) tuples from leaf to root.
-    direction: "L" = sibling is on the left, "R" = sibling is on the right.
+    Returns a list of (direction, sibling_hash) from leaf to root, where
+    direction = "R" if the sibling is on the right (our node is a left child),
+                "L" if the sibling is on the left  (our node is a right child).
 
-    Used by Phase 6 (inclusion_proof.py).
-    O(n log n) — not hot path.
+    Consistent with the MTH definition in compute_root(): the path verifies
+    against the SAME root that is sealed and anchored. O(n) to build, O(log n)
+    in size and to verify.
     """
-    if not leaves or leaf_index >= len(leaves):
+    n = len(leaves)
+    if n == 0 or leaf_index < 0 or leaf_index >= n:
         return []
-
-    size = next_power_of_two(len(leaves))
-    level = list(leaves) + [empty_hash()] * (size - len(leaves))
-    index = leaf_index
-    proof = []
-
-    while len(level) > 1:
-        sib = sibling_index(index)
-        direction = "R" if is_left_child(index) else "L"
-        proof.append((direction, level[sib] if sib < len(level) else empty_hash()))
-
-        # Build next level
-        next_level = []
-        for i in range(0, len(level), 2):
-            next_level.append(hash_node(level[i], level[i + 1]))
-        level = next_level
-        index = parent_index(index)
-
-    return proof
+    if n == 1:
+        return []
+    k = _largest_power_of_two_below(n)
+    if leaf_index < k:
+        # our leaf is in the left subtree; sibling is the right subtree root
+        return compute_proof_path(leaves[:k], leaf_index) + [("R", compute_root(leaves[k:]))]
+    else:
+        # our leaf is in the right subtree; sibling is the left subtree root
+        return compute_proof_path(leaves[k:], leaf_index - k) + [("L", compute_root(leaves[:k]))]
 
 
 def verify_proof(leaf_hash: str, proof: list[tuple[str, str]], expected_root: str) -> bool:
